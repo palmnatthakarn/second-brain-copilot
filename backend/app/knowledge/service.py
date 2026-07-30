@@ -5,7 +5,7 @@ import re
 from datetime import UTC, datetime
 from pathlib import Path
 
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -133,7 +133,29 @@ def sync_markdown_repository(db: Session) -> dict:
             embedded_count=stats["embedded"],
         ))
     db.commit()
+    _sync_pgvector_column(db)
     return stats
+
+
+def _sync_pgvector_column(db: Session) -> None:
+    """Backfill the native pgvector embedding column from embedding_json so
+    hybrid_knowledge_search() can use it. Runs for any row still missing it,
+    not just rows touched this sync, so it self-heals after a schema reset."""
+    if db.bind.dialect.name != "postgresql":
+        return
+    rows = db.execute(
+        text("SELECT id, embedding_json FROM knowledge_notes WHERE embedding IS NULL")
+    ).all()
+    for row in rows:
+        vector = json.loads(row.embedding_json or "[]")
+        if len(vector) != 32:
+            continue
+        db.execute(
+            text("UPDATE knowledge_notes SET embedding = CAST(:embedding AS vector) WHERE id = :id"),
+            {"embedding": row.embedding_json, "id": row.id},
+        )
+    if rows:
+        db.commit()
 
 
 def search_notes(db: Session, query: str, category: str | None = None, limit: int = 10) -> list[KnowledgeNoteOut]:
@@ -181,6 +203,73 @@ def hybrid_search_notes(
     text_weight: float = 0.65,
     vector_weight: float = 0.35,
 ) -> list[KnowledgeHybridSearchResult]:
+    if db.bind.dialect.name == "postgresql":
+        return _hybrid_search_notes_postgres(db, query, category, limit, text_weight, vector_weight)
+    return _hybrid_search_notes_python(db, query, category, limit, text_weight, vector_weight)
+
+
+def _hybrid_search_notes_postgres(
+    db: Session,
+    query: str,
+    category: str | None,
+    limit: int,
+    text_weight: float,
+    vector_weight: float,
+) -> list[KnowledgeHybridSearchResult]:
+    """Delegate scoring to the hybrid_knowledge_search() SQL function so it uses the pgvector index."""
+    from app.knowledge.embedding import build_embedding
+
+    query_embedding, _ = build_embedding(query)
+    vector_literal = "[" + ",".join(str(value) for value in query_embedding) + "]"
+    rows = db.execute(
+        text(
+            "SELECT id, text_score, vector_score, hybrid_score "
+            "FROM hybrid_knowledge_search(:query_text, CAST(:query_embedding AS vector), :category_filter, "
+            ":text_weight, :vector_weight, :match_limit)"
+        ),
+        {
+            "query_text": query,
+            "query_embedding": vector_literal,
+            "category_filter": category,
+            "text_weight": text_weight,
+            "vector_weight": vector_weight,
+            "match_limit": limit,
+        },
+    ).all()
+    if not rows:
+        return []
+
+    notes_by_id = {
+        note.id: note
+        for note in db.execute(
+            select(KnowledgeNote).where(KnowledgeNote.id.in_([row.id for row in rows]))
+        ).scalars()
+    }
+    results = []
+    for row in rows:
+        note = notes_by_id.get(row.id)
+        if note is None:
+            continue
+        results.append(
+            KnowledgeHybridSearchResult(
+                **to_note_out(note).model_dump(),
+                text_score=round(row.text_score, 4),
+                vector_score=round(row.vector_score, 4),
+                hybrid_score=round(row.hybrid_score, 4),
+            )
+        )
+    return results
+
+
+def _hybrid_search_notes_python(
+    db: Session,
+    query: str,
+    category: str | None,
+    limit: int,
+    text_weight: float,
+    vector_weight: float,
+) -> list[KnowledgeHybridSearchResult]:
+    """Pure-Python fallback for SQLite local development, where pgvector is unavailable."""
     from app.knowledge.embedding import build_embedding
 
     terms = [term.lower() for term in query.split() if term.strip()]
