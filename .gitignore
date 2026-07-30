@@ -1,0 +1,10 @@
+.env.local
+.venv/
+__pycache__/
+*.py[cod]
+backend/demo.db
+frontend/node_modules/
+frontend/.next/
+frontend/package-lock.json
+.pytest_cache/
+.codebase-memory/

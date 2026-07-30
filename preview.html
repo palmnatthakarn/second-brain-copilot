@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI AP & GL Copilot Preview</title>
+    <style>
+      body { margin: 0; font-family: Arial, sans-serif; color: #17202a; background: #eef2f6; }
+      header { background: #fff; border-bottom: 1px solid #d7dee8; padding: 18px 28px; }
+      main { display: grid; grid-template-columns: 360px 1fr; gap: 20px; max-width: 1180px; margin: 0 auto; padding: 24px; }
+      section { background: #fff; border: 1px solid #d7dee8; border-radius: 6px; padding: 18px; }
+      label { display: block; margin-top: 14px; font-size: 14px; font-weight: 700; }
+      input, textarea, button { width: 100%; margin-top: 8px; padding: 10px 12px; font: inherit; border-radius: 6px; border: 1px solid #d7dee8; }
+      button { background: #0f766e; color: #fff; border: 0; cursor: pointer; font-weight: 700; }
+      h1, h2, h3 { margin: 0; }
+      .muted { color: #64748b; }
+      .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+      .metric { border-bottom: 1px solid #d7dee8; padding-bottom: 10px; }
+      .metric strong { display: block; margin-top: 4px; }
+      table { width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 14px; }
+      th, td { border-top: 1px solid #d7dee8; padding: 10px; text-align: left; }
+      th { background: #f8fafc; }
+      .right { text-align: right; }
+      .warn { background: #fff7ed; border-color: #fed7aa; color: #9a3412; }
+      @media (max-width: 860px) { main { grid-template-columns: 1fr; } .grid { grid-template-columns: 1fr 1fr; } }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>AI AP & GL Copilot</h1>
+      <p class="muted">Dependency-free preview for the local FastAPI MVP.</p>
+    </header>
+    <main>
+      <section>
+        <label>Vendor</label>
+        <input id="vendor" value="ABC" />
+        <label>As of date</label>
+        <input id="date" type="date" value="2025-12-31" />
+        <label>Question</label>
+        <textarea id="question" rows="5">What is this vendor balance and which documents make it up?</textarea>
+        <button id="ask">Ask Copilot</button>
+        <p id="error" class="warn"></p>
+      </section>
+      <section>
+        <h2 id="answer">Ask about vendor ABC to load the seeded AP trace.</h2>
+        <p id="vendorName" class="muted"></p>
+        <div id="metrics" class="grid"></div>
+        <div id="warnings"></div>
+        <table>
+          <thead>
+            <tr>
+              <th>Document</th><th>Type</th><th>Document Date</th><th>Posting Date</th><th>Status</th><th class="right">Debit</th><th class="right">Credit</th>
+            </tr>
+          </thead>
+          <tbody id="documents"></tbody>
+        </table>
+      </section>
+      <section>
+        <h2>Knowledge Search</h2>
+        <p class="muted">Search Markdown notes from the Second Brain vault.</p>
+        <label>Search knowledge</label>
+        <input id="knowledgeQuery" value="เจ้าหนี้ GL" />
+        <button id="searchKnowledge">Search Notes</button>
+        <button id="hybridSearchKnowledge">Hybrid Search</button>
+        <div id="knowledgeResults"></div>
+      </section>
+    </main>
+    <script>
+      const money = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      document.getElementById("ask").addEventListener("click", async () => {
+        document.getElementById("error").textContent = "";
+        const payload = {
+          question: document.getElementById("question").value,
+          vendor_query: document.getElementById("vendor").value,
+          company_id: 1,
+          as_of_date: document.getElementById("date").value,
+          user_id: 1
+        };
+        try {
+          const response = await fetch("http://127.0.0.1:8000/api/copilot/chat", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const data = await response.json();
+          if (!response.ok) throw new Error(data.detail || "Request failed");
+          document.getElementById("answer").textContent = money.format(data.calculation.closing_balance);
+          document.getElementById("vendorName").textContent = `${data.vendor_name} · ${data.vendor_code} · as of ${data.as_of_date}`;
+          document.getElementById("metrics").innerHTML = Object.entries(data.calculation)
+            .filter(([key]) => key !== "formula")
+            .map(([key, value]) => `<div class="metric"><span class="muted">${key.replace("_", " ")}</span><strong>${money.format(value)}</strong></div>`)
+            .join("");
+          document.getElementById("warnings").innerHTML = data.warnings.map((warning) => `<p class="warn">${warning}</p>`).join("");
+          document.getElementById("documents").innerHTML = data.documents.map((doc) => `
+            <tr>
+              <td>${doc.document_no}</td><td>${doc.document_type}</td><td>${doc.document_date}</td><td>${doc.posting_date}</td><td>${doc.status}</td>
+              <td class="right">${money.format(doc.debit)}</td><td class="right">${money.format(doc.credit)}</td>
+            </tr>`).join("");
+        } catch (error) {
+          document.getElementById("error").textContent = error.message;
+        }
+      });
+      document.getElementById("searchKnowledge").addEventListener("click", async () => {
+        const query = document.getElementById("knowledgeQuery").value;
+        const response = await fetch("http://127.0.0.1:8000/api/knowledge/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, limit: 8 })
+        });
+        const data = await response.json();
+        document.getElementById("knowledgeResults").innerHTML = data.results.map((note) => `
+          <div class="metric">
+            <strong>${note.title}</strong>
+            <span class="muted">${note.category} · ${note.path}</span>
+            <p>${note.excerpt}</p>
+          </div>`).join("");
+      });
+      document.getElementById("hybridSearchKnowledge").addEventListener("click", async () => {
+        const query = document.getElementById("knowledgeQuery").value;
+        const response = await fetch("http://127.0.0.1:8000/api/knowledge/hybrid-search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query, limit: 8 })
+        });
+        const data = await response.json();
+        document.getElementById("knowledgeResults").innerHTML = data.results.map((note) => `
+          <div class="metric">
+            <strong>${note.title}</strong>
+            <span class="muted">${note.category} · score ${note.hybrid_score}</span>
+            <p>${note.excerpt}</p>
+          </div>`).join("");
+      });
+    </script>
+  </body>
+</html>
