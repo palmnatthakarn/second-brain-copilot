@@ -23,6 +23,12 @@ from app.knowledge.markdown import (
 from app.models.erp import KnowledgeNote, KnowledgeSyncEvent
 from app.schemas.knowledge import KnowledgeCaptureRequest, KnowledgeHybridSearchResult, KnowledgeNoteOut
 
+# Must match the pgvector column definition in infra/postgres/init/001_knowledge_pgvector.sql
+# (embedding VECTOR(32)). Only the local hash-based embedding (32 dims) fits this column today;
+# turning on ENABLE_OPENAI_EMBEDDINGS produces 1536-dim vectors and requires migrating the column
+# first, otherwise rows silently stop getting a pgvector embedding (see docs/postgres-pgvector.md).
+PGVECTOR_DIMENSIONS = 32
+
 
 def repository_root() -> Path:
     configured = Path(get_settings().markdown_repository_path)
@@ -148,7 +154,13 @@ def _sync_pgvector_column(db: Session) -> None:
     ).all()
     for row in rows:
         vector = json.loads(row.embedding_json or "[]")
-        if len(vector) != 32:
+        if len(vector) != PGVECTOR_DIMENSIONS:
+            print(
+                f"knowledge_notes.id={row.id}: embedding has {len(vector)} dimensions, "
+                f"but the pgvector column is VECTOR({PGVECTOR_DIMENSIONS}). Skipping this row "
+                "instead of failing the sync. This happens when ENABLE_OPENAI_EMBEDDINGS is on "
+                "without migrating the column dimension first (see docs/postgres-pgvector.md)."
+            )
             continue
         db.execute(
             text("UPDATE knowledge_notes SET embedding = CAST(:embedding AS vector) WHERE id = :id"),
@@ -221,6 +233,8 @@ def _hybrid_search_notes_postgres(
 
     query_embedding, _ = build_embedding(query)
     vector_literal = "[" + ",".join(str(value) for value in query_embedding) + "]"
+    # Ask the SQL function for a few extra rows so filtering out Templates below
+    # (to match search_notes' behavior) doesn't leave fewer than `limit` results.
     rows = db.execute(
         text(
             "SELECT id, text_score, vector_score, hybrid_score "
@@ -233,7 +247,7 @@ def _hybrid_search_notes_postgres(
             "category_filter": category,
             "text_weight": text_weight,
             "vector_weight": vector_weight,
-            "match_limit": limit,
+            "match_limit": limit + 5,
         },
     ).all()
     if not rows:
@@ -248,7 +262,7 @@ def _hybrid_search_notes_postgres(
     results = []
     for row in rows:
         note = notes_by_id.get(row.id)
-        if note is None:
+        if note is None or note.category == "Templates":
             continue
         results.append(
             KnowledgeHybridSearchResult(
@@ -258,6 +272,8 @@ def _hybrid_search_notes_postgres(
                 hybrid_score=round(row.hybrid_score, 4),
             )
         )
+        if len(results) >= limit:
+            break
     return results
 
 
@@ -274,7 +290,7 @@ def _hybrid_search_notes_python(
 
     terms = [term.lower() for term in query.split() if term.strip()]
     query_embedding, _ = build_embedding(query)
-    statement = select(KnowledgeNote)
+    statement = select(KnowledgeNote).where(KnowledgeNote.category != "Templates")
     if category:
         statement = statement.where(KnowledgeNote.category == category)
     notes = db.execute(statement).scalars().all()
